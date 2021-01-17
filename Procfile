@@ -1,1 +1,1 @@
-web: bin/project
+web: bin/notification-service
