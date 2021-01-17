@@ -1,92 +1,50 @@
 package main
 
 import (
-	"encoding/gob"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
-	"time"
 
-	"example.com/project/handlers"
-	"example.com/project/helpers"
-	"example.com/project/models"
-	sharedModels "github.com/dkacperski97/programowanie-aplikacji-mobilnych-i-webowych-models"
+	"example.com/notification-service/handlers"
+	"example.com/notification-service/models"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
-	"github.com/pmoule/go2hal/hal"
 )
 
 var client *redis.Client
 
-func getLabels(w http.ResponseWriter, req *http.Request) {
-	claims, _ := handlers.GetClaims(req.Context())
-
-	var labels []sharedModels.Label
-	var err error
-
-	if claims.Role == "sender" {
-		labels, err = helpers.GetLabelsBySender(client, claims.User)
-	} else {
-		labels, err = helpers.GetLabels(client)
-	}
-
-	if err != nil {
-		log.Print(err.Error())
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	root := hal.NewResourceObject()
-
-	self, _ := hal.NewLinkRelation("self")
-	self.SetLink(&hal.LinkObject{Href: "/labels"})
-	root.AddLink(self)
-
-	var embeddedLabels []hal.Resource
-
-	for _, label := range labels {
-		embeddedLabel := hal.NewResourceObject()
-
-		if label.AssignedParcel == "" {
-			if claims.Role == "sender" {
-				href := fmt.Sprintf("/labels/%s", label.ID)
-				self, _ := hal.NewLinkRelation("self")
-				self.SetLink(&hal.LinkObject{Href: href})
-				embeddedLabel.AddLink(self)
-			} else {
-				assign, _ := hal.NewLinkRelation("assign")
-				assign.SetLink(&hal.LinkObject{Href: "/parcels"})
-				embeddedLabel.AddLink(assign)
-			}
-		}
-
-		embeddedLabel.AddData(label)
-		embeddedLabels = append(embeddedLabels, embeddedLabel)
-	}
-
-	labelsRelation, _ := hal.NewResourceRelation("labels")
-	labelsRelation.SetResources(embeddedLabels)
-
-	root.AddResource(labelsRelation)
-
-	bytes, err := hal.NewEncoder().ToJSON(root)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/hal+json")
-	w.Write(bytes)
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(req *http.Request) bool {
+		origin := req.Header.Get("Origin")
+		return origin == os.Getenv("APP_1_ORIGIN") || origin == os.Getenv("APP_2_ORIGIN")
+	},
 }
 
-func createLabel(w http.ResponseWriter, req *http.Request) {
+func getNotifications(w http.ResponseWriter, req *http.Request) {
+	claims, _ := handlers.GetClaims(req.Context())
+	if claims.Role != "sender" {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	c, err := upgrader.Upgrade(w, req, nil)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	defer func() {
+		c.Close()
+	}()
+	models.WatchNotifications(client, c, claims.User)
+}
+
+func addNotification(w http.ResponseWriter, req *http.Request) {
 	claims, _ := handlers.GetClaims(req.Context())
 
-	if claims.Role != "sender" {
+	if claims.Role != "courier" {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
@@ -97,84 +55,34 @@ func createLabel(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var label sharedModels.Label
+	var notification models.Notification
 
 	decoder := json.NewDecoder(req.Body)
 	decoder.DisallowUnknownFields()
-	err := decoder.Decode(&label)
+	err := decoder.Decode(&notification)
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
 
-	if label.Sender != claims.User {
+	validationErr, err := models.IsNotificationValid(notification.User, notification.Message)
+	if validationErr != nil {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
 
-	err = helpers.SaveLabel(client, &label)
+	err = notification.Save(client)
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
 
 	w.WriteHeader(http.StatusCreated)
-	w.Header().Set("Location", "/labels/"+string(label.ID))
-}
-
-func removeLabel(w http.ResponseWriter, req *http.Request) {
-	vars := mux.Vars(req)
-	labelID := vars["labelId"]
-
-	claims, _ := handlers.GetClaims(req.Context())
-
-	if claims.Role != "sender" {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	err := helpers.RemoveLabel(
-		client,
-		claims.User,
-		labelID,
-	)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-}
-
-func index(w http.ResponseWriter, req *http.Request) {
-	claims, ok := handlers.GetClaims(req.Context())
-
-	root := hal.NewResourceObject()
-
-	self, _ := hal.NewLinkRelation("self")
-	self.SetLink(&hal.LinkObject{Href: "/"})
-	root.AddLink(self)
-
-	if ok {
-		labels, _ := hal.NewLinkRelation("labels")
-		labels.SetLink(&hal.LinkObject{Href: "/labels"})
-		root.AddLink(labels)
-
-		if claims.Role != "sender" {
-			parcels, _ := hal.NewLinkRelation("parcels")
-			parcels.SetLink(&hal.LinkObject{Href: "/parcels"})
-			root.AddLink(parcels)
-		}
-	}
-
-	bytes, err := hal.NewEncoder().ToJSON(root)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/hal+json")
-	w.Write(bytes)
+	w.Header().Set("Location", "/notifications")
 }
 
 func getRedisClient() *redis.Client {
@@ -199,153 +107,6 @@ func getRedisClient() *redis.Client {
 	})
 }
 
-func getParcels(w http.ResponseWriter, req *http.Request) {
-	claims, _ := handlers.GetClaims(req.Context())
-
-	var parcels []models.Parcel
-	var err error
-
-	if claims.Role == "sender" {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	parcels, err = models.GetParcels(client)
-	if err != nil {
-		log.Print(err.Error())
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	root := hal.NewResourceObject()
-
-	self, _ := hal.NewLinkRelation("self")
-	self.SetLink(&hal.LinkObject{Href: "/parcels"})
-	root.AddLink(self)
-
-	var embeddedParcels []hal.Resource
-
-	for _, parcel := range parcels {
-		href := fmt.Sprintf("/parcels/%s", parcel.ID)
-		self, _ := hal.NewLinkRelation("self")
-		self.SetLink(&hal.LinkObject{Href: href})
-
-		embeddedParcel := hal.NewResourceObject()
-		embeddedParcel.AddLink(self)
-		embeddedParcel.AddData(parcel)
-		embeddedParcels = append(embeddedParcels, embeddedParcel)
-	}
-
-	parcelsRelation, _ := hal.NewResourceRelation("parcels")
-	parcelsRelation.SetResources(embeddedParcels)
-
-	root.AddResource(parcelsRelation)
-
-	bytes, err := hal.NewEncoder().ToJSON(root)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/hal+json")
-	w.Write(bytes)
-}
-
-func createParcel(w http.ResponseWriter, req *http.Request) {
-	claims, _ := handlers.GetClaims(req.Context())
-
-	if claims.Role == "sender" {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	headerContentType := req.Header.Get("Content-Type")
-	if headerContentType != "application/json" {
-		http.Error(w, "Content Type is not application/json", http.StatusUnsupportedMediaType)
-		return
-	}
-
-	type Label struct {
-		ID sharedModels.LabelID `json:"labelId"`
-	}
-	var label Label
-
-	decoder := json.NewDecoder(req.Body)
-	decoder.DisallowUnknownFields()
-	err := decoder.Decode(&label)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	parcel, validationErr, err := models.CreateParcel(string(label.ID), models.ParcelStatusOnTheWay)
-	if validationErr != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	err = parcel.Save(client)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
-	w.Header().Set("Location", "/parcels/"+string(parcel.ID))
-}
-
-func changeParcelStatus(w http.ResponseWriter, req *http.Request) {
-	vars := mux.Vars(req)
-	parcelID := vars["parcelId"]
-
-	claims, _ := handlers.GetClaims(req.Context())
-
-	if claims.Role == "sender" {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	headerContentType := req.Header.Get("Content-Type")
-	if headerContentType != "application/json" {
-		http.Error(w, "Content Type is not application/json", http.StatusUnsupportedMediaType)
-		return
-	}
-
-	var parcel models.Parcel
-
-	decoder := json.NewDecoder(req.Body)
-	decoder.DisallowUnknownFields()
-	err := decoder.Decode(&parcel)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	parcel.ID = parcelID
-
-	validationErr, err := models.IsParcelValid(parcel.ID, parcel.Status)
-	if validationErr != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	err = parcel.UpdateStatus(client)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func main() {
 	err := godotenv.Load()
 	if err == nil {
@@ -355,32 +116,19 @@ func main() {
 	client = getRedisClient()
 	defer client.Close()
 
-	gob.Register(&time.Time{})
-
 	mainRouter := mux.NewRouter()
 
-	r2 := mainRouter.PathPrefix("/").Subrouter()
-	r2.HandleFunc("/labels", http.HandlerFunc(getLabels)).Methods(http.MethodGet, http.MethodOptions)
-	r2.HandleFunc("/labels", http.HandlerFunc(createLabel)).Methods(http.MethodPost, http.MethodOptions)
-	r2.HandleFunc("/labels/{labelId}", http.HandlerFunc(removeLabel)).Methods(http.MethodDelete, http.MethodOptions)
-	r2.HandleFunc("/parcels", http.HandlerFunc(getParcels)).Methods(http.MethodGet, http.MethodOptions)
-	r2.HandleFunc("/parcels", http.HandlerFunc(createParcel)).Methods(http.MethodPost, http.MethodOptions)
-	r2.HandleFunc("/parcels/{parcelId}", http.HandlerFunc(changeParcelStatus)).Methods(http.MethodPut, http.MethodOptions)
-	r2.Use(mux.CORSMethodMiddleware(r2))
-	r2.Use(handlers.JwtHandler([]byte(os.Getenv("JWT_SECRET")), true))
-	r2.Use(handlers.HeadersHandler())
-
-	r := mainRouter.PathPrefix("/").Subrouter()
-	r.HandleFunc("/", http.HandlerFunc(index)).Methods(http.MethodGet, http.MethodOptions)
-	r.Use(mux.CORSMethodMiddleware(r))
-	r.Use(handlers.JwtHandler([]byte(os.Getenv("JWT_SECRET")), false))
-	r.Use(handlers.HeadersHandler())
+	mainRouter.HandleFunc("/notifications", http.HandlerFunc(addNotification)).Methods(http.MethodPost, http.MethodOptions)
+	mainRouter.HandleFunc("/notifications/ws", http.HandlerFunc(getNotifications))
+	mainRouter.Use(mux.CORSMethodMiddleware(mainRouter))
+	mainRouter.Use(handlers.JwtHandler([]byte(os.Getenv("JWT_SECRET")), true))
+	mainRouter.Use(handlers.HeadersHandler())
 
 	http.Handle("/", mainRouter)
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "5000"
+		port = "5500"
 	}
 
 	s := &http.Server{

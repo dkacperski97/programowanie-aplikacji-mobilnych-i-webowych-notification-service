@@ -26,8 +26,13 @@ func GetClaims(ctx context.Context) (*models.UserClaims, bool) {
 func JwtHandler(secret []byte, isTokenRequired bool) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			tokenString := strings.Replace(req.Header.Get("Authorization"), "Bearer ", "", 1)
-
+			var tokenHeader string
+			if req.Header.Get("Authorization") != "" {
+				tokenHeader = req.Header.Get("Authorization")
+			} else {
+				tokenHeader = req.Header.Get("Sec-WebSocket-Protocol")
+			}
+			tokenString := strings.Replace(tokenHeader, "Bearer ", "", 1)
 			token, err := jwt.ParseWithClaims(tokenString, &models.UserClaims{}, func(token *jwt.Token) (interface{}, error) {
 				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 					return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
